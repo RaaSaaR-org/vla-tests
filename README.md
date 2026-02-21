@@ -38,7 +38,7 @@ We're testing multiple open-source VLA models -- see [docs/vla-models.md](docs/v
 | Component | What you need |
 |-----------|---------------|
 | **GPU server** | Linux machine with a GPU that has >8 GB VRAM (e.g. RTX 4090, RTX 5090, A100). Ubuntu 22.04+ recommended. |
-| **Robot side** | Raspberry Pi (or any Linux machine) + USB camera + robot arm (e.g. [SO-100](https://wiki.seeedstudio.com/lerobot_so100m_new/)) |
+| **Robot side** | Raspberry Pi (or any Linux machine) + camera (CSI or USB) + robot arm (e.g. [SO-101](https://wiki.seeedstudio.com/lerobot_so100m_new/)) |
 | **Network** | Both machines on the same network, or connected via [Tailscale](https://tailscale.com/) |
 
 ## Quick Start
@@ -99,6 +99,7 @@ micromamba run -n openpi uv run examples/simple_client/main.py --host <SERVER_IP
 vla-test/
 ├── README.md              ← You are here
 ├── CLAUDE.md              ← Context file for Claude Code
+├── agents.md              ← How to SSH to the Pi and run commands from agents
 ├── docs/
 │   └── vla-models.md      ← Comparison of all VLA models
 ├── pi05/                  ← pi0/pi0.5 via OpenPI (WebSocket)
@@ -167,3 +168,4 @@ See [docs/vla-models.md](docs/vla-models.md) for a detailed comparison of all mo
 - [pi0.5 in LeRobot docs](https://huggingface.co/docs/lerobot/pi05) — model details, fine-tuning, benchmarks
 - [SO-100 robot arm guide](https://wiki.seeedstudio.com/lerobot_so100m_new/) — hardware assembly & LeRobot setup
 - [Physical Intelligence blog](https://www.physicalintelligence.company/blog/pi05) — pi0.5 research paper & motivation
+- [Agents guide](agents.md) — how to SSH to the Pi and run commands from AI agents

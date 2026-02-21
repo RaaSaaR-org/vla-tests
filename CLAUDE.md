@@ -4,7 +4,7 @@
 
 VLA (Vision-Language-Action) test project for running open-source VLA models on a GPU server and controlling an SO-101 robot arm remotely. Currently supports pi0/pi0.5 (OpenPI), with GR00T N1 and SmolVLA in progress.
 
-**Architecture:** GPU server (policy inference) <--network--> Raspberry Pi (USB camera + SO-101 arm)
+**Architecture:** GPU server (policy inference) <--Tailscale--> Raspberry Pi 5 (CSI camera + SO-101 arm)
 
 ## Directory Structure
 
@@ -25,18 +25,21 @@ smolvla/               HuggingFace SmolVLA via LeRobot async (gRPC, port 8080)
 
 docs/
   vla-models.md        Comparison of all VLA models (pi0, SmolVLA, GR00T, ACT, etc.)
+agents.md              How to SSH to Pi, run commands from agents
 ```
 
 ## Key Technical Details
 
-### pi0/pi0.5 (currently implemented)
+### pi0/pi0.5 (currently implemented and tested end-to-end)
 - **Package manager:** uv (not pip). Use `uv sync` and `uv run`.
-- **Python:** >=3.10
+- **Python:** >=3.11 (OpenPI requires 3.11+, not 3.10)
 - **Client dependencies:** `openpi-client`, `lerobot[feetech]`
 - **Image processing:** Camera frames resized+padded to 224x224 via `openpi_client.image_tools`
 - **Policy server:** OpenPI `serve_policy.py`, default port 8000, WebSocket
 - **Supported configs:** `pi05_droid`, `pi0_fast_droid`, `pi0_aloha`, `pi0_libero`
+- **Default config:** `droid` (client sends DROID observation keys by default)
 - **GPU requirements:** >8 GB VRAM inference, >22.5 GB LoRA, >70 GB full fine-tuning
+- **Checkpoint size:** 11.6 GB (pi05_droid), cached at `~/.cache/openpi/openpi-assets/checkpoints/pi05_droid`
 
 ### GR00T N1.6 (setup docs ready)
 - **Server:** Isaac-GR00T `run_gr00t_server.py`, port 5555
@@ -56,10 +59,58 @@ docs/
 ## Working with the Client (pi0.5)
 
 - `client_pi.py` uses `SO101Follower` from LeRobot for real hardware control
+- Import path: `lerobot.robots.so_follower` (not `so101_follower`)
+- Config class: `lerobot.robots.so_follower.config_so_follower.SO101FollowerConfig`
 - CLI args: `--port` (required, USB serial), `--robot-id` (default `my_so101`), `--server-port` (default 8000)
+- Default config is `droid` — sends DROID observation keys (see table below)
 - Two control loop modes: standard (query every step) and chunked (`--chunked`)
 - Observation dict keys must match the server-side policy config exactly
-- Default observation keys are LIBERO-style (`observation/image`, `observation/state`)
+- Camera: uses picamera2 for CSI cameras (Pi), falls back to OpenCV for USB cameras
+- Calibration: auto-loaded from several candidate paths (see `_load_calibration` in client_pi.py)
+
+### Observation Keys
+
+| `--config` | Server configs | Image keys | State keys |
+|------------|----------------|-----------|------------|
+| `droid` (default) | `pi05_droid`, `pi0_fast_droid` | `observation/exterior_image_1_left`, `observation/wrist_image_left` | `observation/joint_position` (7), `observation/gripper_position` (1) |
+| `libero` | `pi0_libero`, `pi05_libero` | `observation/image`, `observation/wrist_image` | `observation/state` (8) |
+
+## Hardware Setup
+
+### GPU Server (peter-ubuntu)
+- **Tailscale IP:** `100.125.78.40`
+- **GPU:** NVIDIA RTX 5090 (Blackwell, sm_120, 32 GB VRAM)
+- **CUDA:** 13 (driver), 12.x (runtime via pip packages — backward compatible)
+- **OpenPI repo:** `/home/peter/repos/openpi/`
+- **Environment:** micromamba env `openpi` (Python 3.11 + uv)
+- **RTX 5090 note:** JAX inference works via PTX compilation. Do NOT use PyTorch-format checkpoints (`.safetensors`) — stick to default JAX/Orbax checkpoints.
+
+### Raspberry Pi 5
+- **Tailscale IP:** `100.84.200.83`
+- **SSH:** `ssh mindcube@100.84.200.83` (key-based, no password)
+- **Client code:** `~/repos/vla-tests/pi05/client/`
+- **Robot port:** `/dev/ttyACM0` (SO-101 via USB)
+- **Cameras:** CSI — IMX477 (index 0, HQ camera) + OV5647 (index 1)
+- **Camera library:** picamera2 (system-installed, venv needs `--system-site-packages`)
+- **Calibration:** `~/develop/backup/robot-calibration-data.json`
+
+See [agents.md](agents.md) for detailed instructions on running commands on the Pi.
+
+## Known Issues
+
+- **Motor 5 (wrist_roll) flaky:** Sometimes fails handshake ("Missing motor IDs: - 5"). Retrying usually works — likely a loose servo cable.
+- **numpy version conflict:** `openpi-client` pins `numpy<2.0` while `lerobot` requires `numpy>=2` via `rerun-sdk`. Both work fine at runtime with numpy 2.x. Workaround: install lerobot separately with `uv pip install` after `uv sync`.
+- **picamera2 cannot be pip-installed:** It depends on system libcamera bindings. The venv must be created with `uv venv --system-site-packages`.
+- **Partial checkpoint downloads corrupt:** If the 11.6 GB checkpoint download is interrupted, delete `~/.cache/openpi/openpi-assets/checkpoints/pi05_droid` before retrying.
+
+## Tested Performance
+
+| Metric | Value |
+|--------|-------|
+| Server-only inference (RTX 5090) | ~47.5 ms (p50) |
+| Full Pi-to-server round-trip (Tailscale) | ~132 ms steady state |
+| Control loop frequency | 5 Hz |
+| Longest test run | 570+ steps ("lift the green ship") |
 
 ## External References
 
