@@ -1,9 +1,18 @@
 """
 client_pi.py — Runs on Raspberry Pi with camera + SO-101 robot.
 
-Usage:
-    python client_pi.py --host 192.168.1.100 --server-port 8000 \
+Supports two backends:
+  openpi  — WebSocket to OpenPI server (port 8000, JAX, DROID/Libero configs)
+  lerobot — gRPC to LeRobot async server (port 8080, PyTorch, pi0.5/SmolVLA)
+
+Usage (OpenPI — legacy):
+    python client_pi.py --backend openpi --host 100.125.78.40 --server-port 8000 \
         --port /dev/ttyACM0 --config droid --prompt "pick up the cup"
+
+Usage (LeRobot — recommended):
+    python client_pi.py --backend lerobot --host 100.125.78.40 --server-port 8080 \
+        --port /dev/ttyACM0 --model Elvinky/pi05_so101_pick_place_bottle \
+        --prompt "pick up the green object"
 """
 
 import argparse
@@ -13,13 +22,11 @@ from pathlib import Path
 
 import numpy as np
 
-from openpi_client import image_tools
-from openpi_client import websocket_client_policy
 
-
-# ── Observation builders ─────────────────────────────────────────
-# Each server config expects a different set of observation keys.
+# ── Observation builders (OpenPI backend) ────────────────────────
+# Each OpenPI server config expects a different set of observation keys.
 # See the root README "Observation Keys by Config" table.
+# NOTE: These import openpi_client lazily — only needed for the openpi backend.
 
 def build_observation_droid(img, state, prompt, wrist_img=None):
     """Build observation dict for pi05_droid / pi0_fast_droid configs.
@@ -39,6 +46,8 @@ def build_observation_droid(img, state, prompt, wrist_img=None):
     has 5-DOF with a different kinematic chain. The pretrained checkpoint
     will NOT produce useful actions without fine-tuning on SO-101 data.
     """
+    from openpi_client import image_tools
+
     # SO-101: state[0:5] = arm joints (degrees), state[5] = gripper (0-100)
     arm_joints_deg = state[:5]
     gripper_raw = state[5] if len(state) > 5 else 0.0
@@ -78,6 +87,8 @@ def build_observation_libero(img, state, prompt, wrist_img=None):
         observation/state       (8,) float
         prompt                  str
     """
+    from openpi_client import image_tools
+
     obs = {
         "observation/image": image_tools.convert_to_uint8(
             image_tools.resize_with_pad(img, 224, 224)
@@ -386,12 +397,135 @@ def droid_action_to_so101(action: np.ndarray, current_state: np.ndarray,
     return target
 
 
-# ── Control Loop ─────────────────────────────────────────────────
+# ── LeRobot gRPC Client ──────────────────────────────────────────
+# Talks to a LeRobot async inference server (policy_server) over gRPC.
+# Protocol: pickle-serialized TimedObservation → TimedAction via protobuf.
 
-def control_loop(host: str, server_port: int, prompt: str, config: str,
-                 robot_port: str, robot_id: str, camera_type: str,
-                 calibration_file: str | None = None,
-                 skip_motors: list[str] | None = None, hz: float = 5.0):
+# SO-101 joint names in canonical order (must match training data)
+SO101_MOTOR_NAMES = [
+    "shoulder_pan", "shoulder_lift", "elbow_flex",
+    "wrist_flex", "wrist_roll", "gripper",
+]
+
+
+class LeRobotClient:
+    """gRPC client for LeRobot async inference server."""
+
+    def __init__(self, host: str, port: int, model: str,
+                 policy_type: str = "pi05", device: str = "cuda",
+                 actions_per_chunk: int = 50,
+                 camera_width: int = 640, camera_height: int = 480):
+        import pickle
+        import grpc
+        from lerobot.transport import services_pb2, services_pb2_grpc
+        from lerobot.transport.utils import grpc_channel_options
+
+        self._pickle = pickle
+        self._pb2 = services_pb2
+        self._pb2_grpc = services_pb2_grpc
+
+        # Connect
+        addr = f"{host}:{port}"
+        print(f"Connecting to LeRobot server at {addr}...")
+        channel = grpc.insecure_channel(addr, options=grpc_channel_options())
+        self.stub = services_pb2_grpc.AsyncInferenceStub(channel)
+
+        # Handshake
+        self.stub.Ready(services_pb2.Empty())
+        print("  Handshake OK")
+
+        # Send policy config — tells server which model to load
+        from lerobot.async_inference.helpers import RemotePolicyConfig
+        lerobot_features = {
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (len(SO101_MOTOR_NAMES),),
+                "names": [f"{n}.pos" for n in SO101_MOTOR_NAMES],
+            },
+            "observation.images.front": {
+                "dtype": "image",
+                "shape": (camera_height, camera_width, 3),
+                "names": ["height", "width", "channels"],
+            },
+        }
+        config = RemotePolicyConfig(
+            policy_type=policy_type,
+            pretrained_name_or_path=model,
+            lerobot_features=lerobot_features,
+            actions_per_chunk=actions_per_chunk,
+            device=device,
+        )
+        config_bytes = pickle.dumps(config)
+        self.stub.SendPolicyInstructions(
+            services_pb2.PolicySetup(data=config_bytes)
+        )
+        print(f"  Model loaded: {model} ({policy_type}, {device})")
+        print(f"  Actions per chunk: {actions_per_chunk}")
+
+    def send_observation(self, image: np.ndarray, state: np.ndarray,
+                         prompt: str, step: int):
+        """Send one observation to the server.
+
+        Args:
+            image: (H, W, 3) uint8 RGB from camera
+            state: (6,) float — SO-101 joint positions (degrees/normalized)
+            prompt: language instruction
+            step: current timestep counter
+        """
+        from lerobot.async_inference.helpers import TimedObservation
+        from lerobot.transport.utils import send_bytes_in_chunks
+
+        # Build raw observation dict matching LeRobot convention:
+        #   "motor_name.pos": float  for each joint
+        #   "front": np.ndarray      for camera image
+        #   "task": str              for language instruction
+        raw_obs = {}
+        for i, name in enumerate(SO101_MOTOR_NAMES):
+            raw_obs[f"{name}.pos"] = float(state[i]) if i < len(state) else 0.0
+        raw_obs["front"] = image
+        raw_obs["task"] = prompt
+
+        timed_obs = TimedObservation(
+            timestamp=time.time(),
+            observation=raw_obs,
+            timestep=step,
+            must_go=True,  # always process (we're sending 1:1, no similarity skip)
+        )
+        obs_bytes = self._pickle.dumps(timed_obs)
+        iterator = send_bytes_in_chunks(
+            obs_bytes, self._pb2.Observation, silent=True
+        )
+        self.stub.SendObservations(iterator)
+
+    def get_actions(self):
+        """Poll for actions from the server.
+
+        Returns:
+            list of numpy arrays, each shape (6,) — absolute joint positions.
+            Empty list if no actions ready.
+        """
+        response = self.stub.GetActions(self._pb2.Empty())
+        if len(response.data) == 0:
+            return []
+        timed_actions = self._pickle.loads(response.data)
+        # Convert torch tensors to numpy for consistency with the rest of our code
+        actions = []
+        for ta in timed_actions:
+            a = ta.action
+            if hasattr(a, 'numpy'):
+                a = a.numpy()
+            actions.append(np.array(a, dtype=np.float32))
+        return actions
+
+
+# ── Control Loop (OpenPI backend) ────────────────────────────────
+
+def control_loop_openpi(host: str, server_port: int, prompt: str, config: str,
+                        robot_port: str, robot_id: str, camera_type: str,
+                        calibration_file: str | None = None,
+                        skip_motors: list[str] | None = None, hz: float = 5.0):
+    from openpi_client import websocket_client_policy
+
     build_obs = OBSERVATION_BUILDERS[config]
     is_droid = (config == "droid")
     robot = RobotInterface(port=robot_port, robot_id=robot_id,
@@ -402,7 +536,7 @@ def control_loop(host: str, server_port: int, prompt: str, config: str,
     client = websocket_client_policy.WebsocketClientPolicy(
         host=host, port=server_port,
     )
-    print(f"Connected to policy server at {host}:{server_port} (config: {config})")
+    print(f"Connected to OpenPI server at {host}:{server_port} (config: {config})")
 
     period = 1.0 / hz
     step = 0
@@ -444,16 +578,18 @@ def control_loop(host: str, server_port: int, prompt: str, config: str,
         robot.disconnect()
 
 
-# ── Action Chunking (optional, better performance) ───────────────
+# ── Control Loop (OpenPI chunked) ────────────────────────────────
 
-def control_loop_chunked(host: str, server_port: int, prompt: str, config: str,
-                         robot_port: str, robot_id: str, camera_type: str,
-                         calibration_file: str | None = None,
-                         skip_motors: list[str] | None = None, hz: float = 10.0):
+def control_loop_openpi_chunked(host: str, server_port: int, prompt: str, config: str,
+                                robot_port: str, robot_id: str, camera_type: str,
+                                calibration_file: str | None = None,
+                                skip_motors: list[str] | None = None, hz: float = 10.0):
     """
     More efficient: query the server every N steps and execute the
     full action chunk open-loop in between. This reduces latency impact.
     """
+    from openpi_client import websocket_client_policy
+
     build_obs = OBSERVATION_BUILDERS[config]
     is_droid = (config == "droid")
     robot = RobotInterface(port=robot_port, robot_id=robot_id,
@@ -507,14 +643,115 @@ def control_loop_chunked(host: str, server_port: int, prompt: str, config: str,
         robot.disconnect()
 
 
+# ── Control Loop (LeRobot backend) ───────────────────────────────
+
+def control_loop_lerobot(host: str, server_port: int, prompt: str,
+                         model: str, policy_type: str,
+                         robot_port: str, robot_id: str, camera_type: str,
+                         calibration_file: str | None = None,
+                         skip_motors: list[str] | None = None,
+                         hz: float = 5.0, actions_per_chunk: int = 50,
+                         device: str = "cuda"):
+    """Control loop using LeRobot async inference (gRPC).
+
+    Actions from the LeRobot server are absolute joint positions — no
+    velocity integration needed. The server handles normalization/
+    unnormalization internally via the checkpoint's pre/post processors.
+
+    Action chunking is built-in: the server returns `actions_per_chunk`
+    actions per inference. We execute them open-loop, then re-query.
+    """
+    robot = RobotInterface(port=robot_port, robot_id=robot_id,
+                           calibration_file=calibration_file,
+                           skip_motors=skip_motors)
+    camera = make_camera(camera_type)
+
+    client = LeRobotClient(
+        host=host, port=server_port, model=model,
+        policy_type=policy_type, device=device,
+        actions_per_chunk=actions_per_chunk,
+        camera_width=640, camera_height=480,
+    )
+
+    period = 1.0 / hz
+    step = 0
+    action_queue = []  # buffered actions from last inference
+    action_idx = 0
+
+    print(f"\nLeRobot control loop running at {hz} Hz")
+    print(f"Prompt: \"{prompt}\"")
+    print(f"Actions are absolute joint positions (no conversion needed)")
+    print("Press Ctrl+C to stop\n")
+
+    try:
+        while True:
+            t_start = time.time()
+
+            # Need new actions? Send observation and get a chunk
+            if action_idx >= len(action_queue):
+                img = camera.capture()
+                state = robot.get_state()
+
+                # Send observation
+                client.send_observation(img, state, prompt, step)
+
+                # Get action chunk (blocks until server responds)
+                action_queue = client.get_actions()
+                action_idx = 0
+
+                if not action_queue:
+                    # Server didn't return actions (timeout) — retry
+                    print(f"[Step {step}] WARNING: no actions received, retrying...")
+                    continue
+
+                if step % 10 == 0:
+                    elapsed = time.time() - t_start
+                    print(f"[Step {step}] inference latency={elapsed*1000:.0f}ms, "
+                          f"chunk_size={len(action_queue)}")
+
+            # Execute next action from the chunk
+            target = action_queue[action_idx]
+            robot.send_action(target)
+            action_idx += 1
+            step += 1
+
+            elapsed = time.time() - t_start
+            time.sleep(max(0, period - elapsed))
+
+    except KeyboardInterrupt:
+        print(f"\nStopped after {step} steps")
+    finally:
+        camera.release()
+        robot.disconnect()
+
+
 # ── Main ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="pi0.5 Robot Client")
+    parser = argparse.ArgumentParser(
+        description="pi0.5 Robot Client — control SO-101 via OpenPI or LeRobot server",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # LeRobot backend (recommended) — SO-101 pick-and-place checkpoint:
+  python client_pi.py --backend lerobot --host 100.125.78.40 \\
+      --port /dev/ttyACM0 --prompt "pick up the green object"
+
+  # OpenPI backend (legacy) — DROID checkpoint:
+  python client_pi.py --backend openpi --host 100.125.78.40 \\
+      --port /dev/ttyACM0 --config droid --prompt "pick up the cup"
+""",
+    )
+
+    # ── Common args ──
+    parser.add_argument("--backend", default="lerobot",
+                        choices=["openpi", "lerobot"],
+                        help="Server backend: lerobot (gRPC, recommended) or "
+                             "openpi (WebSocket, legacy). Default: lerobot")
     parser.add_argument("--host", default="localhost",
                         help="GPU server IP (default: localhost)")
-    parser.add_argument("--server-port", type=int, default=8000,
-                        help="Policy server port (default: 8000)")
+    parser.add_argument("--server-port", type=int, default=None,
+                        help="Policy server port (default: 8080 for lerobot, 8000 for openpi)")
     parser.add_argument("--port", required=True,
                         help="USB serial port for the SO-101 (e.g. /dev/ttyACM0)")
     parser.add_argument("--robot-id", default="my_so101",
@@ -523,10 +760,6 @@ if __name__ == "__main__":
                         help="Path to robot-calibration-data.json (auto-detected if omitted)")
     parser.add_argument("--skip-motors", nargs="*", default=None,
                         help="Motor names to skip (e.g. wrist_roll if cable is loose)")
-    parser.add_argument("--config", default="droid",
-                        choices=list(OBSERVATION_BUILDERS.keys()),
-                        help="Server policy config -- must match what the server is running "
-                             "(default: droid)")
     parser.add_argument("--prompt", default="pick up the object",
                         help="Language instruction for the robot")
     parser.add_argument("--hz", type=float, default=5.0,
@@ -535,18 +768,49 @@ if __name__ == "__main__":
                         choices=["auto", "opencv", "picamera2"],
                         help="Camera backend: auto (try picamera2 first), opencv, "
                              "or picamera2 (default: auto)")
+
+    # ── OpenPI-only args ──
+    parser.add_argument("--config", default="droid",
+                        choices=list(OBSERVATION_BUILDERS.keys()),
+                        help="[openpi] Server policy config (default: droid)")
     parser.add_argument("--chunked", action="store_true",
-                        help="Use action chunking for better throughput")
+                        help="[openpi] Execute full action chunk between server queries")
+
+    # ── LeRobot-only args ──
+    parser.add_argument("--model", default="Elvinky/pi05_so101_pick_place_bottle",
+                        help="[lerobot] HuggingFace model or local path "
+                             "(default: Elvinky/pi05_so101_pick_place_bottle)")
+    parser.add_argument("--policy-type", default="pi05",
+                        help="[lerobot] Policy architecture: pi05, smolvla, act, etc. "
+                             "(default: pi05)")
+    parser.add_argument("--device", default="cuda",
+                        help="[lerobot] Inference device on the server (default: cuda)")
+    parser.add_argument("--actions-per-chunk", type=int, default=50,
+                        help="[lerobot] Actions returned per inference (default: 50)")
+
     args = parser.parse_args()
 
-    kwargs = dict(
-        host=args.host, server_port=args.server_port, prompt=args.prompt,
-        config=args.config, robot_port=args.port, robot_id=args.robot_id,
-        camera_type=args.camera_type, calibration_file=args.calibration_file,
-        skip_motors=args.skip_motors, hz=args.hz,
-    )
+    # Default port depends on backend
+    if args.server_port is None:
+        args.server_port = 8080 if args.backend == "lerobot" else 8000
 
-    if args.chunked:
-        control_loop_chunked(**kwargs)
+    if args.backend == "lerobot":
+        control_loop_lerobot(
+            host=args.host, server_port=args.server_port, prompt=args.prompt,
+            model=args.model, policy_type=args.policy_type,
+            robot_port=args.port, robot_id=args.robot_id,
+            camera_type=args.camera_type, calibration_file=args.calibration_file,
+            skip_motors=args.skip_motors, hz=args.hz,
+            actions_per_chunk=args.actions_per_chunk, device=args.device,
+        )
     else:
-        control_loop(**kwargs)
+        kwargs = dict(
+            host=args.host, server_port=args.server_port, prompt=args.prompt,
+            config=args.config, robot_port=args.port, robot_id=args.robot_id,
+            camera_type=args.camera_type, calibration_file=args.calibration_file,
+            skip_motors=args.skip_motors, hz=args.hz,
+        )
+        if args.chunked:
+            control_loop_openpi_chunked(**kwargs)
+        else:
+            control_loop_openpi(**kwargs)
