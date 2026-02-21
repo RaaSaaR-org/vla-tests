@@ -37,7 +37,7 @@ We're testing multiple open-source VLA models -- see [docs/vla-models.md](docs/v
 
 | Component | What you need |
 |-----------|---------------|
-| **GPU server** | Linux machine with a GPU that has >8 GB VRAM (e.g. RTX 4090, A100). Ubuntu 22.04 recommended. |
+| **GPU server** | Linux machine with a GPU that has >8 GB VRAM (e.g. RTX 4090, RTX 5090, A100). Ubuntu 22.04+ recommended. |
 | **Robot side** | Raspberry Pi (or any Linux machine) + USB camera + robot arm (e.g. [SO-100](https://wiki.seeedstudio.com/lerobot_so100m_new/)) |
 | **Network** | Both machines on the same network, or connected via [Tailscale](https://tailscale.com/) |
 
@@ -48,13 +48,16 @@ We're testing multiple open-source VLA models -- see [docs/vla-models.md](docs/v
 Set up OpenPI and serve a policy checkpoint. Full instructions in [`pi05/server/README.md`](pi05/server/README.md).
 
 ```bash
+# Create environment with micromamba
+micromamba create -n openpi python=3.11 uv -c conda-forge -y
+
 # Clone OpenPI
-git clone --recurse-submodules git@github.com:Physical-Intelligence/openpi.git
+git clone --recurse-submodules https://github.com/Physical-Intelligence/openpi.git
 cd openpi
-GIT_LFS_SKIP_SMUDGE=1 uv sync
+GIT_LFS_SKIP_SMUDGE=1 micromamba run -n openpi uv sync
 
 # Serve pi0.5 DROID checkpoint
-uv run scripts/serve_policy.py policy:checkpoint \
+micromamba run -n openpi uv run scripts/serve_policy.py policy:checkpoint \
   --policy.config=pi05_droid \
   --policy.dir=gs://openpi-assets/checkpoints/pi05_droid
 ```
@@ -87,7 +90,7 @@ On any machine that can reach the GPU server, you can test with OpenPI's built-i
 
 ```bash
 # From the openpi repo
-uv run examples/simple_client/main.py --host <SERVER_IP> --env DROID
+micromamba run -n openpi uv run examples/simple_client/main.py --host <SERVER_IP> --env DROID
 ```
 
 ## Project Structure
