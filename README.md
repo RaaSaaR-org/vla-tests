@@ -80,8 +80,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 cd pi05/client
 uv sync
 
-# Run the client
-uv run client_pi.py --host <GPU_SERVER_IP> --prompt "pick up the cup"
+# Run the client (--config must match the server policy)
+uv run client_pi.py --host <GPU_SERVER_IP> --config droid --prompt "pick up the cup"
 ```
 
 ### 3. Verify Connection

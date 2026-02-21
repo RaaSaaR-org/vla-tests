@@ -4,11 +4,16 @@ version = "0.1.0"
 description = "Raspberry Pi client for OpenPI policy server"
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=1.22.4,<2.0.0",
+    "numpy>=1.22.4",
     "opencv-python>=4.8",
+    "typing-extensions>=4.0",
     "openpi-client @ git+https://github.com/Physical-Intelligence/openpi.git#subdirectory=packages/openpi-client",
-    "lerobot[feetech] @ git+https://github.com/huggingface/lerobot.git",
 ]
+
+# lerobot[feetech] is also required but installed separately due to a numpy
+# version conflict between openpi-client (<2.0) and lerobot (>=2 via rerun-sdk).
+# Both work fine at runtime with numpy 1.x. Install after uv sync:
+#   uv pip install "lerobot[feetech] @ git+https://github.com/huggingface/lerobot.git"
 
 [tool.uv]
 # Script-only project, no package to build
