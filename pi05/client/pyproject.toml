@@ -1,0 +1,14 @@
+[project]
+name = "vla-client"
+version = "0.1.0"
+description = "Raspberry Pi client for OpenPI policy server"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.22.4,<2.0.0",
+    "opencv-python>=4.8",
+    "openpi-client @ git+https://github.com/Physical-Intelligence/openpi.git#subdirectory=packages/openpi-client",
+]
+
+[tool.uv]
+# Script-only project, no package to build
+package = false

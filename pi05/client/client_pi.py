@@ -1,0 +1,217 @@
+"""
+client_pi.py — Runs on Raspberry Pi with camera + robot.
+
+Usage:
+    python client_pi.py --host 192.168.1.100 --port 8000 --prompt "pick up the cup"
+"""
+
+import argparse
+import time
+import numpy as np
+
+from openpi_client import image_tools
+from openpi_client import websocket_client_policy
+
+
+# ── Robot Interface ──────────────────────────────────────────────
+# Replace this with your actual LeRobot hardware setup.
+# Example for SO-100 / SO-101 / Koch v1.1 with Dynamixel or Feetech servos.
+
+class RobotInterface:
+    def __init__(self):
+        # TODO: Initialize your LeRobot robot here
+        # from lerobot.common.robot_devices.robots.manipulator import ManipulatorRobot
+        # self.robot = ManipulatorRobot(...)
+        # self.robot.connect()
+        self.num_joints = 6
+        self._state = np.zeros(self.num_joints, dtype=np.float32)
+        print(f"Robot initialized ({self.num_joints} joints)")
+
+    def get_state(self) -> np.ndarray:
+        """Read current joint positions."""
+        # TODO: return self.robot.get_observation()["observation.state"]
+        return self._state
+
+    def send_action(self, action: np.ndarray):
+        """Send joint commands."""
+        # TODO: self.robot.send_action(action)
+        self._state = action[:self.num_joints]
+        print(f"  → {action[:self.num_joints]}")
+
+    def disconnect(self):
+        # TODO: self.robot.disconnect()
+        pass
+
+
+# ── Camera Interface ─────────────────────────────────────────────
+
+class CameraInterface:
+    def __init__(self, camera_index=0, width=640, height=480):
+        import cv2
+        self.cv2 = cv2
+        self.cap = cv2.VideoCapture(camera_index)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open camera {camera_index}")
+        print(f"Camera {camera_index} ready ({width}x{height})")
+
+    def capture(self) -> np.ndarray:
+        """Capture a frame as a numpy array (H, W, 3) uint8 BGR."""
+        ret, frame = self.cap.read()
+        if not ret:
+            raise RuntimeError("Failed to capture frame")
+        # Convert BGR → RGB
+        return self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2RGB)
+
+    def release(self):
+        self.cap.release()
+
+
+# ── Control Loop ─────────────────────────────────────────────────
+
+def control_loop(host: str, port: int, prompt: str, hz: float = 5.0):
+    robot = RobotInterface()
+    camera = CameraInterface()
+
+    # Connect to the GPU policy server via websocket
+    client = websocket_client_policy.WebsocketClientPolicy(
+        host=host,
+        port=port,
+    )
+    print(f"Connected to policy server at {host}:{port}")
+
+    period = 1.0 / hz
+    step = 0
+
+    print(f"\nControl loop running at {hz} Hz")
+    print(f"Prompt: \"{prompt}\"")
+    print("Press Ctrl+C to stop\n")
+
+    try:
+        while True:
+            t_start = time.time()
+
+            # 1. Capture image
+            img = camera.capture()  # (H, W, 3) uint8
+
+            # 2. Read robot state
+            state = robot.get_state()
+
+            # 3. Build observation in OpenPI format
+            # - Resize + pad to 224x224 (standard for π₀ models)
+            # - Server handles normalization of state
+            observation = {
+                "observation/image": image_tools.convert_to_uint8(
+                    image_tools.resize_with_pad(img, 224, 224)
+                ),
+                "observation/state": state,
+                "prompt": prompt,
+            }
+
+            # If you have a wrist camera too:
+            # observation["observation/wrist_image"] = image_tools.convert_to_uint8(
+            #     image_tools.resize_with_pad(wrist_img, 224, 224)
+            # )
+
+            # 4. Inference — returns action chunk
+            result = client.infer(observation)
+            action_chunk = result["actions"]  # shape: (horizon, action_dim)
+
+            # 5. Execute first action (or loop through the chunk)
+            robot.send_action(action_chunk[0])
+
+            # 6. Timing
+            elapsed = time.time() - t_start
+            if step % 10 == 0:
+                print(f"[Step {step}] latency={elapsed*1000:.0f}ms")
+
+            time.sleep(max(0, period - elapsed))
+            step += 1
+
+    except KeyboardInterrupt:
+        print(f"\nStopped after {step} steps")
+    finally:
+        camera.release()
+        robot.disconnect()
+
+
+# ── Action Chunking (optional, better performance) ───────────────
+
+def control_loop_chunked(host: str, port: int, prompt: str, hz: float = 10.0):
+    """
+    More efficient: query the server every N steps and execute the
+    full action chunk open-loop in between. This reduces latency impact.
+    """
+    robot = RobotInterface()
+    camera = CameraInterface()
+
+    client = websocket_client_policy.WebsocketClientPolicy(host=host, port=port)
+    print(f"Connected to {host}:{port} (chunked mode)")
+
+    period = 1.0 / hz
+    step = 0
+    action_chunk = None
+    chunk_idx = 0
+
+    try:
+        while True:
+            t_start = time.time()
+
+            # Only query server when we've exhausted the current chunk
+            if action_chunk is None or chunk_idx >= len(action_chunk):
+                img = camera.capture()
+                state = robot.get_state()
+
+                observation = {
+                    "observation/image": image_tools.convert_to_uint8(
+                        image_tools.resize_with_pad(img, 224, 224)
+                    ),
+                    "observation/state": state,
+                    "prompt": prompt,
+                }
+
+                result = client.infer(observation)
+                action_chunk = result["actions"]
+                chunk_idx = 0
+
+                if step % 10 == 0:
+                    elapsed = time.time() - t_start
+                    print(f"[Step {step}] inference latency={elapsed*1000:.0f}ms, "
+                          f"chunk_size={len(action_chunk)}")
+
+            # Execute next action from chunk
+            robot.send_action(action_chunk[chunk_idx])
+            chunk_idx += 1
+            step += 1
+
+            elapsed = time.time() - t_start
+            time.sleep(max(0, period - elapsed))
+
+    except KeyboardInterrupt:
+        print(f"\nStopped after {step} steps")
+    finally:
+        camera.release()
+        robot.disconnect()
+
+
+# ── Main ─────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="π₀.₅ Robot Client")
+    parser.add_argument("--host", default="localhost",
+                        help="GPU server IP (default: localhost)")
+    parser.add_argument("--port", type=int, default=8000,
+                        help="Policy server port (default: 8000)")
+    parser.add_argument("--prompt", default="pick up the object",
+                        help="Language instruction for the robot")
+    parser.add_argument("--hz", type=float, default=5.0,
+                        help="Control frequency in Hz")
+    parser.add_argument("--chunked", action="store_true",
+                        help="Use action chunking for better throughput")
+    args = parser.parse_args()
+
+    if args.chunked:
+        control_loop_chunked(args.host, args.port, args.prompt, args.hz)
+    else:
+        control_loop(args.host, args.port, args.prompt, args.hz)
