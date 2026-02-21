@@ -2,9 +2,16 @@
 
 ## Project Overview
 
-VLA (Vision-Language-Action) test project for running open-source VLA models on a GPU server and controlling an SO-101 robot arm remotely. Currently supports pi0/pi0.5 (OpenPI), with GR00T N1 and SmolVLA in progress.
+VLA (Vision-Language-Action) test project for running open-source VLA models on a GPU server and controlling an SO-101 robot arm remotely. Supports pi0/pi0.5 via both OpenPI (JAX, WebSocket) and LeRobot-native (PyTorch, gRPC). GR00T N1 and SmolVLA docs also included.
 
 **Architecture:** GPU server (policy inference) <--Tailscale--> Raspberry Pi 5 (CSI camera + SO-101 arm)
+
+### Two pi0.5 paths
+
+| Path | Framework | Protocol | Checkpoint | Notes |
+|------|-----------|----------|------------|-------|
+| **OpenPI** (legacy) | JAX | WebSocket :8000 | `pi05_droid` (Franka-trained) | Custom `client_pi.py`. DROID actions are velocities for 7-DOF Franka — requires conversion for SO-101. |
+| **LeRobot** (recommended) | PyTorch | gRPC :8080 | `lerobot/pi05_base` (cross-embodiment) | Built-in `policy_server` + `robot_client`. Native SO-101 support. Needs fine-tuning on SO-101 demos. |
 
 ## Directory Structure
 
@@ -14,6 +21,7 @@ pi05/                  pi0/pi0.5 via OpenPI (WebSocket, port 8000)
     client_pi.py       Main client (SO-101 RobotInterface, CameraInterface, control loop)
     pyproject.toml     Python project config (uses uv)
   server/              GPU server setup (OpenPI, checkpoints)
+                       LeRobot pi0.5 also installed here (micromamba env `lerobot`)
 
 groot/                 NVIDIA GR00T N1.6 via Isaac-GR00T / LeRobot
   client/              PolicyClient or LeRobot in-process setup
@@ -82,8 +90,10 @@ agents.md              How to SSH to Pi, run commands from agents
 - **GPU:** NVIDIA RTX 5090 (Blackwell, sm_120, 32 GB VRAM)
 - **CUDA:** 13 (driver), 12.x (runtime via pip packages — backward compatible)
 - **OpenPI repo:** `/home/peter/repos/openpi/`
-- **Environment:** micromamba env `openpi` (Python 3.11 + uv)
-- **RTX 5090 note:** JAX inference works via PTX compilation. Do NOT use PyTorch-format checkpoints (`.safetensors`) — stick to default JAX/Orbax checkpoints.
+- **Environments:**
+  - `openpi` (Python 3.11 + uv) — JAX, for OpenPI `serve_policy.py`
+  - `lerobot` (Python 3.11 + pip) — PyTorch, for LeRobot `policy_server` + `lerobot-train`
+- **RTX 5090 note:** JAX inference works via PTX compilation. Do NOT use PyTorch-format checkpoints (`.safetensors`) with OpenPI — stick to default JAX/Orbax checkpoints. LeRobot uses PyTorch natively and works fine.
 
 ### Raspberry Pi 5
 - **Tailscale IP:** `100.84.200.83`
