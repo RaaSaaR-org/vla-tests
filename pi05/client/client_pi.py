@@ -2,48 +2,58 @@
 client_pi.py — Runs on Raspberry Pi with camera + robot.
 
 Usage:
-    python client_pi.py --host 192.168.1.100 --port 8000 --prompt "pick up the cup"
+    python client_pi.py --host 192.168.1.100 --server-port 8000 \
+        --port /dev/ttyACM0 --prompt "pick up the cup"
 """
 
 import argparse
 import time
 import numpy as np
 
+from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy
 
 
-# ── Robot Interface ──────────────────────────────────────────────
-# Replace this with your actual LeRobot hardware setup.
-# Example for SO-100 / SO-101 / Koch v1.1 with Dynamixel or Feetech servos.
+# ── Robot Interface (SO-101 via LeRobot) ────────────────────────
 
 class RobotInterface:
-    def __init__(self):
-        # TODO: Initialize your LeRobot robot here
-        # from lerobot.common.robot_devices.robots.manipulator import ManipulatorRobot
-        # self.robot = ManipulatorRobot(...)
-        # self.robot.connect()
-        self.num_joints = 6
-        self._state = np.zeros(self.num_joints, dtype=np.float32)
-        print(f"Robot initialized ({self.num_joints} joints)")
+    JOINT_NAMES = [
+        "shoulder_pan", "shoulder_lift", "elbow_flex",
+        "wrist_flex", "wrist_roll", "gripper",
+    ]
+
+    def __init__(self, port: str, robot_id: str = "my_so101"):
+        config = SO101FollowerConfig(port=port, id=robot_id)
+        self.robot = SO101Follower(config)
+        self.robot.connect()
+        self.num_joints = len(self.JOINT_NAMES)
+        print(f"Robot initialized ({self.num_joints} joints) on {port}")
 
     def get_state(self) -> np.ndarray:
-        """Read current joint positions."""
-        # TODO: return self.robot.get_observation()["observation.state"]
-        return self._state
+        """Read current joint positions (degrees)."""
+        obs = self.robot.get_observation()
+        return np.array(
+            [obs[f"{name}.pos"] for name in self.JOINT_NAMES],
+            dtype=np.float32,
+        )
 
     def send_action(self, action: np.ndarray):
-        """Send joint commands."""
-        # TODO: self.robot.send_action(action)
-        self._state = action[:self.num_joints]
-        print(f"  → {action[:self.num_joints]}")
+        """Send joint commands (degrees). Slices to num_joints if action is longer."""
+        clipped = action[:self.num_joints]
+        action_dict = {
+            f"{name}.pos": float(clipped[i])
+            for i, name in enumerate(self.JOINT_NAMES)
+        }
+        self.robot.send_action(action_dict)
 
     def disconnect(self):
-        # TODO: self.robot.disconnect()
-        pass
+        self.robot.disconnect()
 
 
 # ── Camera Interface ─────────────────────────────────────────────
+# Uses OpenCV directly. LeRobot also provides camera support via
+# SO101FollowerConfig.cameras if you prefer a unified setup.
 
 class CameraInterface:
     def __init__(self, camera_index=0, width=640, height=480):
@@ -70,8 +80,9 @@ class CameraInterface:
 
 # ── Control Loop ─────────────────────────────────────────────────
 
-def control_loop(host: str, port: int, prompt: str, hz: float = 5.0):
-    robot = RobotInterface()
+def control_loop(host: str, port: int, prompt: str, robot_port: str,
+                  robot_id: str = "my_so101", hz: float = 5.0):
+    robot = RobotInterface(port=robot_port, robot_id=robot_id)
     camera = CameraInterface()
 
     # Connect to the GPU policy server via websocket
@@ -138,12 +149,13 @@ def control_loop(host: str, port: int, prompt: str, hz: float = 5.0):
 
 # ── Action Chunking (optional, better performance) ───────────────
 
-def control_loop_chunked(host: str, port: int, prompt: str, hz: float = 10.0):
+def control_loop_chunked(host: str, port: int, prompt: str, robot_port: str,
+                         robot_id: str = "my_so101", hz: float = 10.0):
     """
     More efficient: query the server every N steps and execute the
     full action chunk open-loop in between. This reduces latency impact.
     """
-    robot = RobotInterface()
+    robot = RobotInterface(port=robot_port, robot_id=robot_id)
     camera = CameraInterface()
 
     client = websocket_client_policy.WebsocketClientPolicy(host=host, port=port)
@@ -201,8 +213,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="π₀.₅ Robot Client")
     parser.add_argument("--host", default="localhost",
                         help="GPU server IP (default: localhost)")
-    parser.add_argument("--port", type=int, default=8000,
+    parser.add_argument("--server-port", type=int, default=8000,
                         help="Policy server port (default: 8000)")
+    parser.add_argument("--port", required=True,
+                        help="USB serial port for the SO-101 (e.g. /dev/ttyACM0)")
+    parser.add_argument("--robot-id", default="my_so101",
+                        help="Robot calibration identity (default: my_so101)")
     parser.add_argument("--prompt", default="pick up the object",
                         help="Language instruction for the robot")
     parser.add_argument("--hz", type=float, default=5.0,
@@ -212,6 +228,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.chunked:
-        control_loop_chunked(args.host, args.port, args.prompt, args.hz)
+        control_loop_chunked(args.host, args.server_port, args.prompt,
+                             args.port, args.robot_id, args.hz)
     else:
-        control_loop(args.host, args.port, args.prompt, args.hz)
+        control_loop(args.host, args.server_port, args.prompt,
+                     args.port, args.robot_id, args.hz)

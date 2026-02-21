@@ -7,6 +7,7 @@ dependencies = [
     "numpy>=1.22.4,<2.0.0",
     "opencv-python>=4.8",
     "openpi-client @ git+https://github.com/Physical-Intelligence/openpi.git#subdirectory=packages/openpi-client",
+    "lerobot[feetech] @ git+https://github.com/huggingface/lerobot.git",
 ]
 
 [tool.uv]
