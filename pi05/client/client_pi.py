@@ -4,6 +4,14 @@ client_pi.py — Runs on Raspberry Pi with camera + robot.
 Usage:
     python client_pi.py --host 192.168.1.100 --server-port 8000 \
         --port /dev/ttyACM0 --prompt "pick up the cup"
+
+    # For DROID-config server (pi05_droid / pi0_fast_droid):
+    python client_pi.py --host 192.168.1.100 --config droid \
+        --port /dev/ttyACM0 --prompt "pick up the cup"
+
+    # For LIBERO-config server (pi0_libero / pi05_libero):
+    python client_pi.py --host 192.168.1.100 --config libero \
+        --port /dev/ttyACM0 --prompt "pick up the cup"
 """
 
 import argparse
@@ -13,6 +21,65 @@ import numpy as np
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy
+
+
+# ── Observation builders ─────────────────────────────────────────
+# Each server config expects a different set of observation keys.
+# See the root README "Observation Keys by Config" table.
+
+def build_observation_droid(img, state, prompt, wrist_img=None):
+    """Build observation dict for pi05_droid / pi0_fast_droid configs.
+
+    Expected by the server:
+        observation/exterior_image_1_left  (224, 224, 3) uint8
+        observation/wrist_image_left       (224, 224, 3) uint8
+        observation/joint_position         (7,) float
+        observation/gripper_position       (1,) float
+        prompt                             str
+    """
+    obs = {
+        "observation/exterior_image_1_left": image_tools.convert_to_uint8(
+            image_tools.resize_with_pad(img, 224, 224)
+        ),
+        "observation/wrist_image_left": image_tools.convert_to_uint8(
+            image_tools.resize_with_pad(
+                wrist_img if wrist_img is not None else img, 224, 224
+            )
+        ),
+        "observation/joint_position": state[:7].astype(np.float64),
+        "observation/gripper_position": state[7:8].astype(np.float64) if len(state) > 7 else np.zeros(1),
+        "prompt": prompt,
+    }
+    return obs
+
+
+def build_observation_libero(img, state, prompt, wrist_img=None):
+    """Build observation dict for pi0_libero / pi05_libero configs.
+
+    Expected by the server:
+        observation/image       (224, 224, 3) uint8
+        observation/wrist_image (224, 224, 3) uint8  (optional)
+        observation/state       (8,) float
+        prompt                  str
+    """
+    obs = {
+        "observation/image": image_tools.convert_to_uint8(
+            image_tools.resize_with_pad(img, 224, 224)
+        ),
+        "observation/state": state.astype(np.float64),
+        "prompt": prompt,
+    }
+    if wrist_img is not None:
+        obs["observation/wrist_image"] = image_tools.convert_to_uint8(
+            image_tools.resize_with_pad(wrist_img, 224, 224)
+        )
+    return obs
+
+
+OBSERVATION_BUILDERS = {
+    "droid": build_observation_droid,
+    "libero": build_observation_libero,
+}
 
 
 # ── Robot Interface (SO-101 via LeRobot) ────────────────────────
@@ -52,10 +119,12 @@ class RobotInterface:
 
 
 # ── Camera Interface ─────────────────────────────────────────────
-# Uses OpenCV directly. LeRobot also provides camera support via
-# SO101FollowerConfig.cameras if you prefer a unified setup.
+# Supports both USB cameras (via OpenCV) and Raspberry Pi CSI cameras
+# (via picamera2). Use --camera-type to select.
 
 class CameraInterface:
+    """OpenCV-based camera for USB webcams."""
+
     def __init__(self, camera_index=0, width=640, height=480):
         import cv2
         self.cv2 = cv2
@@ -64,33 +133,75 @@ class CameraInterface:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open camera {camera_index}")
-        print(f"Camera {camera_index} ready ({width}x{height})")
+        print(f"Camera {camera_index} ready ({width}x{height}) [opencv]")
 
     def capture(self) -> np.ndarray:
-        """Capture a frame as a numpy array (H, W, 3) uint8 BGR."""
+        """Capture a frame as a numpy array (H, W, 3) uint8 RGB."""
         ret, frame = self.cap.read()
         if not ret:
             raise RuntimeError("Failed to capture frame")
-        # Convert BGR → RGB
+        # Convert BGR -> RGB
         return self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2RGB)
 
     def release(self):
         self.cap.release()
 
 
+class PiCameraInterface:
+    """picamera2-based camera for Raspberry Pi CSI cameras (IMX477, OV5647, etc.)."""
+
+    def __init__(self, camera_index=0, width=640, height=480):
+        from picamera2 import Picamera2
+        self.cam = Picamera2(camera_index)
+        config = self.cam.create_video_configuration(
+            main={"size": (width, height), "format": "RGB888"}
+        )
+        self.cam.configure(config)
+        self.cam.start()
+        # Let auto-exposure settle
+        import time
+        time.sleep(0.5)
+        print(f"PiCamera {camera_index} ready ({width}x{height}) [picamera2]")
+
+    def capture(self) -> np.ndarray:
+        """Capture a frame as a numpy array (H, W, 3) uint8 RGB."""
+        return self.cam.capture_array()
+
+    def release(self):
+        self.cam.stop()
+        self.cam.close()
+
+
+def make_camera(camera_type: str, camera_index: int = 0, width: int = 640, height: int = 480):
+    """Factory to create the right camera interface."""
+    if camera_type == "picamera2":
+        return PiCameraInterface(camera_index, width, height)
+    elif camera_type == "opencv":
+        return CameraInterface(camera_index, width, height)
+    elif camera_type == "auto":
+        try:
+            return PiCameraInterface(camera_index, width, height)
+        except Exception:
+            return CameraInterface(camera_index, width, height)
+    else:
+        raise ValueError(f"Unknown camera type: {camera_type}")
+
+
 # ── Control Loop ─────────────────────────────────────────────────
 
 def control_loop(host: str, port: int, prompt: str, robot_port: str,
-                  robot_id: str = "my_so101", hz: float = 5.0):
+                  robot_id: str = "my_so101", config: str = "droid",
+                  camera_type: str = "auto", hz: float = 5.0):
+    build_obs = OBSERVATION_BUILDERS[config]
     robot = RobotInterface(port=robot_port, robot_id=robot_id)
-    camera = CameraInterface()
+    camera = make_camera(camera_type)
 
     # Connect to the GPU policy server via websocket
     client = websocket_client_policy.WebsocketClientPolicy(
         host=host,
         port=port,
     )
-    print(f"Connected to policy server at {host}:{port}")
+    print(f"Connected to policy server at {host}:{port} (config: {config})")
 
     period = 1.0 / hz
     step = 0
@@ -109,21 +220,8 @@ def control_loop(host: str, port: int, prompt: str, robot_port: str,
             # 2. Read robot state
             state = robot.get_state()
 
-            # 3. Build observation in OpenPI format
-            # - Resize + pad to 224x224 (standard for π₀ models)
-            # - Server handles normalization of state
-            observation = {
-                "observation/image": image_tools.convert_to_uint8(
-                    image_tools.resize_with_pad(img, 224, 224)
-                ),
-                "observation/state": state,
-                "prompt": prompt,
-            }
-
-            # If you have a wrist camera too:
-            # observation["observation/wrist_image"] = image_tools.convert_to_uint8(
-            #     image_tools.resize_with_pad(wrist_img, 224, 224)
-            # )
+            # 3. Build observation in the format the server config expects
+            observation = build_obs(img, state, prompt)
 
             # 4. Inference — returns action chunk
             result = client.infer(observation)
@@ -150,16 +248,18 @@ def control_loop(host: str, port: int, prompt: str, robot_port: str,
 # ── Action Chunking (optional, better performance) ───────────────
 
 def control_loop_chunked(host: str, port: int, prompt: str, robot_port: str,
-                         robot_id: str = "my_so101", hz: float = 10.0):
+                         robot_id: str = "my_so101", config: str = "droid",
+                         camera_type: str = "auto", hz: float = 10.0):
     """
     More efficient: query the server every N steps and execute the
     full action chunk open-loop in between. This reduces latency impact.
     """
+    build_obs = OBSERVATION_BUILDERS[config]
     robot = RobotInterface(port=robot_port, robot_id=robot_id)
-    camera = CameraInterface()
+    camera = make_camera(camera_type)
 
     client = websocket_client_policy.WebsocketClientPolicy(host=host, port=port)
-    print(f"Connected to {host}:{port} (chunked mode)")
+    print(f"Connected to {host}:{port} (chunked mode, config: {config})")
 
     period = 1.0 / hz
     step = 0
@@ -175,13 +275,7 @@ def control_loop_chunked(host: str, port: int, prompt: str, robot_port: str,
                 img = camera.capture()
                 state = robot.get_state()
 
-                observation = {
-                    "observation/image": image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(img, 224, 224)
-                    ),
-                    "observation/state": state,
-                    "prompt": prompt,
-                }
+                observation = build_obs(img, state, prompt)
 
                 result = client.infer(observation)
                 action_chunk = result["actions"]
@@ -210,7 +304,7 @@ def control_loop_chunked(host: str, port: int, prompt: str, robot_port: str,
 # ── Main ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="π₀.₅ Robot Client")
+    parser = argparse.ArgumentParser(description="pi0.5 Robot Client")
     parser.add_argument("--host", default="localhost",
                         help="GPU server IP (default: localhost)")
     parser.add_argument("--server-port", type=int, default=8000,
@@ -219,17 +313,27 @@ if __name__ == "__main__":
                         help="USB serial port for the SO-101 (e.g. /dev/ttyACM0)")
     parser.add_argument("--robot-id", default="my_so101",
                         help="Robot calibration identity (default: my_so101)")
+    parser.add_argument("--config", default="droid",
+                        choices=list(OBSERVATION_BUILDERS.keys()),
+                        help="Server policy config — must match what the server is running "
+                             "(default: droid)")
     parser.add_argument("--prompt", default="pick up the object",
                         help="Language instruction for the robot")
     parser.add_argument("--hz", type=float, default=5.0,
                         help="Control frequency in Hz")
+    parser.add_argument("--camera-type", default="auto",
+                        choices=["auto", "opencv", "picamera2"],
+                        help="Camera backend: auto (try picamera2 first), opencv, "
+                             "or picamera2 (default: auto)")
     parser.add_argument("--chunked", action="store_true",
                         help="Use action chunking for better throughput")
     args = parser.parse_args()
 
     if args.chunked:
         control_loop_chunked(args.host, args.server_port, args.prompt,
-                             args.port, args.robot_id, args.hz)
+                             args.port, args.robot_id, args.config,
+                             args.camera_type, args.hz)
     else:
         control_loop(args.host, args.server_port, args.prompt,
-                     args.port, args.robot_id, args.hz)
+                     args.port, args.robot_id, args.config,
+                     args.camera_type, args.hz)

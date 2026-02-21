@@ -24,6 +24,10 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install dependencies (includes LeRobot with Feetech support)
 cd pi05/client
+
+# On Raspberry Pi with a CSI camera: use --system-site-packages so
+# the venv can access the system picamera2 + libcamera bindings
+uv venv --system-site-packages
 uv sync
 ```
 
@@ -54,8 +58,10 @@ See the [SO-101 setup guide](https://wiki.seeedstudio.com/lerobot_so100m_new/) f
 ## Usage
 
 ```bash
-uv run client_pi.py --port /dev/ttyACM0 --host <GPU_SERVER_IP> --prompt "pick up the cup"
+uv run client_pi.py --port /dev/ttyACM0 --host <GPU_SERVER_IP> --config droid --prompt "pick up the cup"
 ```
+
+The `--config` flag controls which observation keys the client sends. It **must match** the policy config running on the server — sending the wrong keys will crash the server.
 
 The client will:
 1. Connect to the SO-101 arm on the specified USB port
@@ -71,8 +77,10 @@ The client will:
 | `--robot-id` | `my_so101` | Robot calibration identity (must match calibration) |
 | `--host` | `localhost` | GPU server IP address (use Tailscale IP if remote) |
 | `--server-port` | `8000` | Policy server port |
+| `--config` | `droid` | Server policy config — must match the server (`droid` or `libero`) |
 | `--prompt` | `pick up the object` | Natural language instruction for the robot |
 | `--hz` | `5.0` | Control loop frequency in Hz |
+| `--camera-type` | `auto` | Camera backend: `auto` (try picamera2 first), `opencv`, or `picamera2` |
 | `--chunked` | off | Execute the full action chunk between server queries |
 
 ### Action Chunking
@@ -80,40 +88,26 @@ The client will:
 By default the client queries the server every loop iteration and executes only the first action from the returned chunk. With `--chunked`, it executes the entire action chunk open-loop before querying again. This reduces the impact of network latency:
 
 ```bash
-uv run client_pi.py --port /dev/ttyACM0 --host 192.168.1.100 --prompt "pick up the cup" --chunked --hz 10
+uv run client_pi.py --port /dev/ttyACM0 --host 192.168.1.100 --config droid --prompt "pick up the cup" --chunked --hz 10
 ```
 
 ## Camera
 
-The client uses OpenCV with a USB camera (`/dev/video0`) by default. Adjust `camera_index`, `width`, and `height` in the `CameraInterface` class as needed.
+Two camera backends are supported:
 
-LeRobot also provides built-in camera support via `SO101FollowerConfig.cameras` — see the [LeRobot docs](https://huggingface.co/docs/lerobot/pi05) if you prefer a unified setup.
+- **picamera2** — for Raspberry Pi CSI cameras (IMX477, OV5647, etc.). Requires `picamera2` installed system-wide (pre-installed on Raspberry Pi OS). Create the venv with `uv venv --system-site-packages` so it can access the system picamera2.
+- **opencv** — for USB webcams via OpenCV `VideoCapture`.
 
-If your robot has a wrist camera, add a second `CameraInterface` instance and include it in the observation dict.
+The `--camera-type auto` default tries picamera2 first, then falls back to opencv. If your robot has a wrist camera, add a second camera instance and pass the frames to the observation builder.
 
 ### Observation Keys
 
-The observation dictionary keys **must match** the policy config running on the server. The default client uses LIBERO-style keys. If you're running a different checkpoint, update the keys:
+The `--config` flag selects the observation builder, so you no longer need to edit the Python code to switch between configs. The client handles the key mapping automatically:
 
-**LIBERO** (default in `client_pi.py`):
-```python
-observation = {
-    "observation/image": ...,       # 224x224 uint8 RGB
-    "observation/state": state,     # 6-dim (joint positions in degrees)
-    "prompt": prompt,
-}
-```
-
-**DROID** (for `pi05_droid` / `pi0_fast_droid`):
-```python
-observation = {
-    "observation/exterior_image_1_left": ...,   # 224x224 uint8 RGB
-    "observation/wrist_image_left": ...,        # 224x224 uint8 RGB (wrist cam)
-    "observation/joint_position": state[:7],    # 7 joints
-    "observation/gripper_position": state[7:8], # 1 gripper
-    "prompt": prompt,
-}
-```
+| `--config` | Server configs | Image keys sent | State keys sent |
+|------------|----------------|----------------|-----------------|
+| `droid` | `pi05_droid`, `pi0_fast_droid` | `exterior_image_1_left`, `wrist_image_left` | `joint_position` (7), `gripper_position` (1) |
+| `libero` | `pi0_libero`, `pi05_libero` | `image`, `wrist_image` (optional) | `state` (8) |
 
 See the [observation keys table](../../README.md#observation-keys-by-config) in the main README for all supported configs.
 
