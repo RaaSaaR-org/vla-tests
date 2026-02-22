@@ -414,7 +414,8 @@ class LeRobotClient:
     def __init__(self, host: str, port: int, model: str,
                  policy_type: str = "pi05", device: str = "cuda",
                  actions_per_chunk: int = 50,
-                 camera_width: int = 640, camera_height: int = 480):
+                 camera_width: int = 640, camera_height: int = 480,
+                 has_wrist_camera: bool = False):
         import pickle
         import grpc
         from lerobot.transport import services_pb2, services_pb2_grpc
@@ -448,6 +449,12 @@ class LeRobotClient:
                 "names": ["height", "width", "channels"],
             },
         }
+        if has_wrist_camera:
+            lerobot_features["observation.images.wrist"] = {
+                "dtype": "image",
+                "shape": (camera_height, camera_width, 3),
+                "names": ["height", "width", "channels"],
+            }
         config = RemotePolicyConfig(
             policy_type=policy_type,
             pretrained_name_or_path=model,
@@ -463,7 +470,8 @@ class LeRobotClient:
         print(f"  Actions per chunk: {actions_per_chunk}")
 
     def send_observation(self, image: np.ndarray, state: np.ndarray,
-                         prompt: str, step: int):
+                         prompt: str, step: int,
+                         wrist_image: np.ndarray | None = None):
         """Send one observation to the server.
 
         Args:
@@ -471,6 +479,7 @@ class LeRobotClient:
             state: (6,) float — SO-101 joint positions (degrees/normalized)
             prompt: language instruction
             step: current timestep counter
+            wrist_image: optional (H, W, 3) uint8 RGB from wrist camera
         """
         from lerobot.async_inference.helpers import TimedObservation
         from lerobot.transport.utils import send_bytes_in_chunks
@@ -483,6 +492,8 @@ class LeRobotClient:
         for i, name in enumerate(SO101_MOTOR_NAMES):
             raw_obs[f"{name}.pos"] = float(state[i]) if i < len(state) else 0.0
         raw_obs["front"] = image
+        if wrist_image is not None:
+            raw_obs["wrist"] = wrist_image
         raw_obs["task"] = prompt
 
         timed_obs = TimedObservation(
@@ -651,7 +662,8 @@ def control_loop_lerobot(host: str, server_port: int, prompt: str,
                          calibration_file: str | None = None,
                          skip_motors: list[str] | None = None,
                          hz: float = 5.0, actions_per_chunk: int = 50,
-                         device: str = "cuda"):
+                         device: str = "cuda",
+                         wrist_camera_index: int = -1):
     """Control loop using LeRobot async inference (gRPC).
 
     Actions from the LeRobot server are absolute joint positions — no
@@ -665,12 +677,16 @@ def control_loop_lerobot(host: str, server_port: int, prompt: str,
                            calibration_file=calibration_file,
                            skip_motors=skip_motors)
     camera = make_camera(camera_type)
+    wrist_cam = None
+    if wrist_camera_index >= 0:
+        wrist_cam = make_camera(camera_type, wrist_camera_index)
 
     client = LeRobotClient(
         host=host, port=server_port, model=model,
         policy_type=policy_type, device=device,
         actions_per_chunk=actions_per_chunk,
         camera_width=640, camera_height=480,
+        has_wrist_camera=(wrist_cam is not None),
     )
 
     period = 1.0 / hz
@@ -690,10 +706,12 @@ def control_loop_lerobot(host: str, server_port: int, prompt: str,
             # Need new actions? Send observation and get a chunk
             if action_idx >= len(action_queue):
                 img = camera.capture()
+                wrist_img = wrist_cam.capture() if wrist_cam else None
                 state = robot.get_state()
 
                 # Send observation
-                client.send_observation(img, state, prompt, step)
+                client.send_observation(img, state, prompt, step,
+                                        wrist_image=wrist_img)
 
                 # Get action chunk (blocks until server responds)
                 action_queue = client.get_actions()
@@ -722,6 +740,8 @@ def control_loop_lerobot(host: str, server_port: int, prompt: str,
         print(f"\nStopped after {step} steps")
     finally:
         camera.release()
+        if wrist_cam:
+            wrist_cam.release()
         robot.disconnect()
 
 
@@ -768,6 +788,8 @@ Examples:
                         choices=["auto", "opencv", "picamera2"],
                         help="Camera backend: auto (try picamera2 first), opencv, "
                              "or picamera2 (default: auto)")
+    parser.add_argument("--wrist-camera-index", type=int, default=-1,
+                        help="Camera index for wrist camera (-1 to disable, default: -1)")
 
     # ── OpenPI-only args ──
     parser.add_argument("--config", default="droid",
@@ -802,6 +824,7 @@ Examples:
             camera_type=args.camera_type, calibration_file=args.calibration_file,
             skip_motors=args.skip_motors, hz=args.hz,
             actions_per_chunk=args.actions_per_chunk, device=args.device,
+            wrist_camera_index=args.wrist_camera_index,
         )
     else:
         kwargs = dict(
